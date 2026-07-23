@@ -1,38 +1,24 @@
 <#
 ==============================================================================
- Test-UndervoltStability.ps1   v3  -- "X3D CO Killer"
+ Test-UndervoltStability.ps1   v4  -- "X3D CO Killer"  (interactive menu)
 ------------------------------------------------------------------------------
- A single-core stress + CORRECTNESS-VERIFICATION tester that hunts unstable
- Curve Optimizer / negative-offset undervolts by hitting EVERY corner of each
- core's voltage/frequency curve -- not just one load type.
+ Single-core stress + CORRECTNESS-VERIFICATION tester for hunting unstable
+ Curve Optimizer / negative-offset undervolts on AMD Ryzen (X3D-focused).
 
- WHY THIS CATCHES WHAT OTHERS MISS
-   Curve Optimizer instability is operating-point specific. A core can pass a
-   heavy AVX-512 furnace for hours yet reboot while browsing, because the two
-   sit at completely different points on the V/F curve. So this tool tests each
-   core with THREE profiles, and verifies the math on all of them:
+ NEW IN v4
+   * Interactive MENU -- pick cores, mode, and duration by number. No more
+     fighting -Cores array parsing on the command line.
+   * REMEMBERS FAILURES. On launch it reads the last run's results; if any core
+     failed it offers to retest exactly those cores (pre-selected) with the
+     profile(s) that failed. Answer Y to start immediately, or N to open the
+     menu with those cores already selected.
 
-     BOOST      scalar, 1 thread  -> highest frequency, lowest voltage
-                (the "crashes at idle" corner; usually the easiest CO fail)
-     TRANSIENT  heavy, both SMT threads, toggled on/off every few ms
-                -> di/dt voltage swings the VRM can't track (the killer)
-     HEAVY      widest vectors (AVX-512), sustained, max current
-                -> the droop-under-load corner
+ Just double-click a launcher or run:
+     pwsh -File .\Test-UndervoltStability.ps1
+ and follow the menu. Command-line switches still work and skip the menu.
 
-   Every block of work is deterministic and checked against a per-core
-   reference; a single wrong bit is caught as an ERROR before a BSOD. WHEA
-   hardware errors and hangs are captured too, and the core under test is
-   logged BEFORE it runs so a hard lock still names the guilty core.
-
- REQUIRES PowerShell 7.4+ (pwsh.exe) for AVX-512. Run ELEVATED is recommended.
-
- QUICK START:
-   pwsh -File .\Test-UndervoltStability.ps1                 # Standard (all 3 profiles)
-   pwsh -File .\Test-UndervoltStability.ps1 -Preset Extreme -Shuffle
-   pwsh -File .\Test-UndervoltStability.ps1 -Mode Transient # just the di/dt killer
-   pwsh -File .\Test-UndervoltStability.ps1 -Cores 3,11     # retest suspects
-
- -SecondsPerCore is PER PROFILE. "All" runs Boost + Transient + Heavy per core.
+ REQUIRES PowerShell 7.4+ (pwsh.exe) for AVX-512.
+ See README.md for full documentation.
 ==============================================================================
 #>
 
@@ -43,16 +29,17 @@ param(
     [int]    $Cycles,
     [ValidateSet('All','Boost','Mid','Heavy','Transient')]
     [string] $Mode,
-    [int]    $ThreadsPerCore = 1,     # threads for the HEAVY profile (1 or 2)
-    [switch] $IncludeMid,             # add an AVX2 mid-curve profile
-    [int]    $TransientOnMs  = 3,     # di/dt: load-on window (ms)
-    [int]    $TransientOffMs = 3,     # di/dt: idle window (ms)
-    [switch] $TransientSweep,         # sweep the toggle period to hit VRM resonances
+    [int]    $ThreadsPerCore = 1,
+    [switch] $IncludeMid,
+    [int]    $TransientOnMs  = 3,
+    [int]    $TransientOffMs = 3,
+    [switch] $TransientSweep,
     [int[]]  $Cores,
     [switch] $Shuffle,
     [switch] $StopOnError,
     [switch] $NoClocks,
     [switch] $NoAvx512,
+    [switch] $NoMenu,
     [string] $LogPath,
     [string] $ReportPath,
 
@@ -72,12 +59,6 @@ param(
     [string] $ResultFile = ""
 )
 
-# ---------------------------------------------------------------------------
-#  Kernels. One class per instruction set, generated from a shared template.
-#  Verification is SELF-REFERENCING (each worker derives its own golden from
-#  its first blocks), so different profiles can use different instruction sets
-#  without any cross-process hash mismatch.
-# ---------------------------------------------------------------------------
 $classTemplate = @'
 public static class __CLASS__
 {
@@ -300,20 +281,6 @@ if ($WorkerMode) {
 $ErrorActionPreference = 'Stop'
 if (-not $PSCommandPath) { Write-Host "Save this to a .ps1 and run it from the file." -ForegroundColor Red; return }
 
-switch ($Preset) {
-    'Quick'     { $d=@{Mode='All';SecondsPerCore=90; Cycles=1;Shuffle=$false} }
-    'Standard'  { $d=@{Mode='All';SecondsPerCore=150;Cycles=1;Shuffle=$false} }
-    'Thorough'  { $d=@{Mode='All';SecondsPerCore=300;Cycles=2;Shuffle=$true } }
-    'Overnight' { $d=@{Mode='All';SecondsPerCore=600;Cycles=6;Shuffle=$true } }
-    'Extreme'   { $d=@{Mode='All';SecondsPerCore=300;Cycles=3;Shuffle=$true } }
-    default     { $d=@{Mode='All';SecondsPerCore=150;Cycles=1;Shuffle=$false} }
-}
-if (-not $PSBoundParameters.ContainsKey('Mode'))          { $Mode           = $d.Mode }
-if (-not $PSBoundParameters.ContainsKey('SecondsPerCore')) { $SecondsPerCore = $d.SecondsPerCore }
-if (-not $PSBoundParameters.ContainsKey('Cycles'))         { $Cycles         = $d.Cycles }
-if (-not $PSBoundParameters.ContainsKey('Shuffle') -and $d.Shuffle) { $Shuffle = [switch]$true }
-if ($Preset -eq 'Extreme') { $IncludeMid = [switch]$true; $TransientSweep = [switch]$true; if (-not $PSBoundParameters.ContainsKey('ThreadsPerCore')) { $ThreadsPerCore = 2 } }
-
 $stamp = Get-Date -Format 'yyyyMMdd_HHmmss'
 $scriptDir = Split-Path $PSCommandPath -Parent
 if (-not $LogPath)    { $LogPath    = Join-Path $scriptDir 'undervolt_test_log.txt' }
@@ -345,9 +312,315 @@ for($i=0;$i -lt $physCores;$i++){
         $coreMasks[$i]=@{ one=([long]1 -shl $lo); both=(([long]1 -shl $lo) -bor ([long]1 -shl ($lo+1))) } }
     else { $corePrimaryLp[$i]=$i; $coreMasks[$i]=@{ one=([long]1 -shl $i); both=([long]1 -shl $i) } }
 }
+$dualCcd    = ($physCores -ge 12)
+$ccdSize    = if($dualCcd){ [int]($physCores/2) } else { $physCores }
+$allCores   = @(0..($physCores-1))
+
+# ===========================================================================
+#  PRIOR-RESULT MEMORY  -- find cores that failed the most recent run
+# ===========================================================================
+function Get-PreviousFailures {
+    $out = [pscustomobject]@{ Cores=@(); Profiles=@(); When=$null; Source=$null; Crashed=$null }
+
+    # 1) newest results CSV in the script folder
+    try {
+        $csv = Get-ChildItem -Path $scriptDir -Filter 'undervolt_results_*.csv' -ErrorAction Stop |
+               Sort-Object LastWriteTime -Descending | Select-Object -First 1
+        if ($csv) {
+            $rows = Import-Csv $csv.FullName
+            $bad  = @($rows | Where-Object { ([int]$_.Fail -gt 0) -or ([int]$_.Whea -gt 0) } | ForEach-Object { [int]$_.Core })
+            if ($bad.Count -gt 0) { $out.Cores = $bad; $out.When = $csv.LastWriteTime; $out.Source = $csv.Name }
+        }
+    } catch {}
+
+    # 2) log gives us WHICH PROFILE failed, plus an unfinished (crash) core
+    try {
+        if (Test-Path $LogPath) {
+            $lines = Get-Content $LogPath -Tail 4000
+            $starts = @(); for($i=0;$i -lt $lines.Count;$i++){ if($lines[$i] -match '=== RUN START ==='){ $starts += $i } }
+            $seg = if($starts.Count -gt 0){ $lines[$starts[-1]..($lines.Count-1)] } else { $lines }
+
+            $profs = @(); $logCoresBad = @()
+            foreach($l in $seg){
+                if($l -match 'core (\d+) \[([A-Z]+)\] FAIL'){ $logCoresBad += [int]$matches[1]; $profs += $matches[2] }
+                elseif($l -match 'core (\d+) \[([A-Z]+)\] WHEA'){ $logCoresBad += [int]$matches[1]; $profs += $matches[2] }
+            }
+            if($profs.Count -gt 0){ $out.Profiles = @($profs | Select-Object -Unique) }
+            if($out.Cores.Count -eq 0 -and $logCoresBad.Count -gt 0){
+                $out.Cores = @($logCoresBad | Select-Object -Unique | Sort-Object); $out.Source = 'log'
+            }
+
+            # unfinished core => prior hard lock / BSOD
+            $suspect=$null; $idx=-1
+            for($j=$seg.Count-1;$j -ge 0;$j--){ if($seg[$j] -match 'begin core (\d+)'){ $suspect=[int]$matches[1]; $idx=$j; break } }
+            if($null -ne $suspect){
+                $after = $seg[$idx..($seg.Count-1)]
+                if(-not (($after -match ("core {0}\b.*(PASS|FAIL|WHEA|REF)" -f $suspect)) -or ($after -match 'RUN END'))){
+                    $out.Crashed = $suspect
+                }
+            }
+        }
+    } catch {}
+
+    $out.Cores = @($out.Cores | Select-Object -Unique | Sort-Object)
+    return $out
+}
+
+# ===========================================================================
+#  MENU HELPERS
+# ===========================================================================
+function Format-CoreList { param([int[]]$List)
+    if(-not $List -or $List.Count -eq 0){ return '(none)' }
+    if($List.Count -eq $physCores){ return "ALL ($physCores cores)" }
+    return ($List -join ',')
+}
+function Read-Choice { param([string]$Prompt='Select')
+    Write-Host ""
+    Write-Host ("  {0}: " -f $Prompt) -NoNewline -ForegroundColor White
+    return (Read-Host)
+}
+function Show-Header {
+    Clear-Host
+    Write-Host ""
+    Write-Host "  ===============================================================" -ForegroundColor Cyan
+    Write-Host "    X3D UNDERVOLT CO KILLER  v4        Curve Optimizer validator" -ForegroundColor Cyan
+    Write-Host "  ===============================================================" -ForegroundColor Cyan
+    Write-Host ("   {0}" -f $cpu.Name.Trim()) -ForegroundColor Gray
+    Write-Host ("   {0} physical / {1} logical cores   |   kernels: {2}" -f $physCores,$logCores,(($Kernels.Keys|Sort-Object) -join ',')) -ForegroundColor DarkGray
+    if($wideKey -ne 'avx512'){ Write-Host "   NOTE: AVX-512 inactive (needs PowerShell 7.4+ on an AVX-512 CPU)" -ForegroundColor Yellow }
+    Write-Host ""
+}
+
+function Select-Cores { param([int[]]$Current,[int[]]$Failed)
+    while($true){
+        Show-Header
+        Write-Host "   SELECT CORES TO TEST" -ForegroundColor White
+        Write-Host "   --------------------" -ForegroundColor DarkGray
+        Write-Host ("     current selection: {0}" -f (Format-CoreList $Current)) -ForegroundColor Green
+        Write-Host ""
+        Write-Host ("     1.  All cores  (0-{0})" -f ($physCores-1))
+        if($Failed.Count -gt 0){
+            Write-Host ("     2.  Previously FAILED cores  ({0})" -f ($Failed -join ',')) -ForegroundColor Yellow
+        } else {
+            Write-Host "     2.  Previously failed cores  (none on record)" -ForegroundColor DarkGray
+        }
+        Write-Host "     3.  Type specific cores"
+        if($dualCcd){
+            Write-Host ("     4.  CCD 0  (cores 0-{0})" -f ($ccdSize-1))
+            Write-Host ("     5.  CCD 1  (cores {0}-{1})" -f $ccdSize,($physCores-1))
+        }
+        Write-Host "     0.  Back"
+        $c = Read-Choice
+        switch($c){
+            '1' { return $allCores }
+            '2' { if($Failed.Count -gt 0){ return $Failed } }
+            '3' {
+                Write-Host ""
+                Write-Host "   Enter core numbers separated by commas or spaces (e.g. 6,15)" -ForegroundColor Gray
+                $raw = Read-Host "   Cores"
+                $parsed = @()
+                foreach($tok in ($raw -split '[,\s]+')){
+                    if($tok -match '^\d+$'){ $n=[int]$tok; if($n -ge 0 -and $n -lt $physCores){ $parsed += $n } }
+                }
+                $parsed = @($parsed | Select-Object -Unique | Sort-Object)
+                if($parsed.Count -gt 0){ return $parsed }
+                Write-Host "   No valid core numbers in that input." -ForegroundColor Red; Start-Sleep 2
+            }
+            '4' { if($dualCcd){ return @(0..($ccdSize-1)) } }
+            '5' { if($dualCcd){ return @($ccdSize..($physCores-1)) } }
+            '0' { return $Current }
+        }
+    }
+}
+
+function Select-Mode { param([string]$Current)
+    while($true){
+        Show-Header
+        Write-Host "   SELECT TEST TYPE" -ForegroundColor White
+        Write-Host "   ----------------" -ForegroundColor DarkGray
+        Write-Host ("     current: {0}" -f $Current) -ForegroundColor Green
+        Write-Host ""
+        Write-Host "     1.  ALL        Boost + Transient + Heavy   (recommended)"
+        Write-Host "     2.  BOOST      max clock / lowest voltage  (idle-crash corner)"
+        Write-Host "     3.  TRANSIENT  di/dt load-step killer      (the nastiest)"
+        Write-Host "     4.  HEAVY      sustained AVX-512, max current"
+        Write-Host "     5.  MID        AVX2 mid-curve"
+        Write-Host "     0.  Back"
+        switch(Read-Choice){
+            '1' { return 'All' } '2' { return 'Boost' } '3' { return 'Transient' }
+            '4' { return 'Heavy' } '5' { return 'Mid' } '0' { return $Current }
+        }
+    }
+}
+
+function Select-Duration { param([string]$CurrentPreset)
+    while($true){
+        Show-Header
+        Write-Host "   SELECT DURATION" -ForegroundColor White
+        Write-Host "   ---------------" -ForegroundColor DarkGray
+        Write-Host ("     current: {0}" -f $CurrentPreset) -ForegroundColor Green
+        Write-Host ""
+        Write-Host "     1.  Quick       90s per profile,  1 cycle"
+        Write-Host "     2.  Standard   150s per profile,  1 cycle"
+        Write-Host "     3.  Thorough   300s per profile,  2 cycles (shuffled)"
+        Write-Host "     4.  Overnight  600s per profile,  6 cycles (shuffled)"
+        Write-Host "     5.  Extreme    300s x3 cycles + AVX2 mid + sweep + 2-thread heavy"
+        Write-Host "     6.  Custom seconds per profile"
+        Write-Host "     0.  Back"
+        switch(Read-Choice){
+            '1' { return 'Quick' } '2' { return 'Standard' } '3' { return 'Thorough' }
+            '4' { return 'Overnight' } '5' { return 'Extreme' }
+            '6' {
+                $s = Read-Host "   Seconds per profile"
+                if($s -match '^\d+$' -and [int]$s -ge 10){ $script:customSeconds=[int]$s; return 'Custom' }
+                Write-Host "   Enter a whole number >= 10." -ForegroundColor Red; Start-Sleep 2
+            }
+            '0' { return $CurrentPreset }
+        }
+    }
+}
+
+function Select-Advanced {
+    while($true){
+        Show-Header
+        Write-Host "   ADVANCED OPTIONS" -ForegroundColor White
+        Write-Host "   ----------------" -ForegroundColor DarkGray
+        Write-Host ("     1.  Transient period sweep .... {0}" -f $(if($script:optSweep){'ON  (hits more VRM frequencies)'}else{'off'}))
+        Write-Host ("     2.  Heavy threads per core .... {0}" -f $script:optThreads)
+        Write-Host ("     3.  Shuffle core order ........ {0}" -f $(if($script:optShuffle){'ON'}else{'off'}))
+        Write-Host ("     4.  Stop on first error ....... {0}" -f $(if($script:optStopOnError){'ON'}else{'off'}))
+        Write-Host ("     5.  Include AVX2 MID profile .. {0}" -f $(if($script:optIncludeMid){'ON'}else{'off'}))
+        Write-Host ("     6.  Cycles .................... {0}" -f $script:optCycles)
+        Write-Host "     0.  Back"
+        switch(Read-Choice){
+            '1' { $script:optSweep = -not $script:optSweep }
+            '2' { $script:optThreads = if($script:optThreads -ge 2){1}else{2} }
+            '3' { $script:optShuffle = -not $script:optShuffle }
+            '4' { $script:optStopOnError = -not $script:optStopOnError }
+            '5' { $script:optIncludeMid = -not $script:optIncludeMid }
+            '6' { $v = Read-Host "   Cycles (1-99)"; if($v -match '^\d+$' -and [int]$v -ge 1 -and [int]$v -le 99){ $script:optCycles=[int]$v } }
+            '0' { return }
+        }
+    }
+}
+
+# ===========================================================================
+#  MENU FLOW
+# ===========================================================================
+$explicitArgs = $PSBoundParameters.ContainsKey('Cores') -or $PSBoundParameters.ContainsKey('Mode') -or
+                $PSBoundParameters.ContainsKey('Preset') -or $PSBoundParameters.ContainsKey('SecondsPerCore')
+$interactive  = $canKeys -and -not $NoMenu -and -not $explicitArgs
+
+# defaults that the menu edits
+$script:optSweep       = [bool]$TransientSweep
+$script:optThreads     = if($ThreadsPerCore -ge 2){2}else{1}
+$script:optShuffle     = [bool]$Shuffle
+$script:optStopOnError = [bool]$StopOnError
+$script:optIncludeMid  = [bool]$IncludeMid
+$script:optCycles      = if($PSBoundParameters.ContainsKey('Cycles')){$Cycles}else{1}
+$script:customSeconds  = 0
+
+$selCores  = if($Cores){ @($Cores|Where-Object{$coreMasks.ContainsKey($_)}) } else { $allCores }
+$selMode   = if($Mode){ $Mode } else { 'All' }
+$selPreset = if($Preset){ $Preset } else { 'Standard' }
+
+if($interactive){
+    $prev = Get-PreviousFailures
+
+    # --- suggestion screen: retest previously failed cores? ---
+    if($prev.Cores.Count -gt 0 -or $null -ne $prev.Crashed){
+        Show-Header
+        Write-Host "   PREVIOUS RESULTS FOUND" -ForegroundColor Yellow
+        Write-Host "   ----------------------" -ForegroundColor DarkGray
+        if($prev.When){ Write-Host ("   Last run: {0:yyyy-MM-dd HH:mm}" -f $prev.When) -ForegroundColor DarkGray }
+        Write-Host ""
+        if($prev.Cores.Count -gt 0){
+            Write-Host ("   These cores FAILED:  {0}" -f ($prev.Cores -join ', ')) -ForegroundColor Red
+            if($prev.Profiles.Count -gt 0){ Write-Host ("   Failing profile(s):  {0}" -f ($prev.Profiles -join ', ')) -ForegroundColor Red }
+        }
+        if($null -ne $prev.Crashed){
+            Write-Host ("   A previous run stopped on Core {0} with no result recorded." -f $prev.Crashed) -ForegroundColor Magenta
+            Write-Host "   If that was a hard lock/BSOD, that core is a prime suspect." -ForegroundColor Magenta
+        }
+        $suggestCores = @($prev.Cores); if($null -ne $prev.Crashed -and $suggestCores -notcontains $prev.Crashed){ $suggestCores += $prev.Crashed }
+        $suggestCores = @($suggestCores | Sort-Object)
+        $suggestMode  = if($prev.Profiles.Count -eq 1){ switch($prev.Profiles[0]){ 'BOOST'{'Boost'} 'TRANSIENT'{'Transient'} 'HEAVY'{'Heavy'} 'MID'{'Mid'} default{'All'} } } else { 'All' }
+
+        Write-Host ""
+        Write-Host "   SUGGESTED RETEST" -ForegroundColor Green
+        Write-Host ("     Cores : {0}" -f ($suggestCores -join ',')) -ForegroundColor Green
+        Write-Host ("     Test  : {0}" -f $suggestMode) -ForegroundColor Green
+        Write-Host  "     Length: Thorough (300s per profile, 2 cycles, shuffled)" -ForegroundColor Green
+        Write-Host ""
+        Write-Host "   (Raise the Curve Optimizer offset on those cores in BIOS first!)" -ForegroundColor DarkYellow
+        Write-Host ""
+        Write-Host "   Run this retest now?  [Y] yes, start    [N] no, open the menu" -ForegroundColor White
+        $ans = Read-Host "   Choice"
+        if($ans -match '^(y|yes|)$'){
+            $selCores=$suggestCores; $selMode=$suggestMode; $selPreset='Thorough'
+            $script:optSweep=$true; $interactive=$false   # skip straight to the run
+        } else {
+            $selCores=$suggestCores; $selMode=$suggestMode   # pre-select, then show menu
+        }
+    }
+}
+
+if($interactive){
+    $go=$false
+    while(-not $go){
+        Show-Header
+        $secPreview = switch($selPreset){ 'Quick'{90} 'Standard'{150} 'Thorough'{300} 'Overnight'{600} 'Extreme'{300} 'Custom'{$script:customSeconds} default{150} }
+        $cycPreview = switch($selPreset){ 'Thorough'{2} 'Overnight'{6} 'Extreme'{3} default{$script:optCycles} }
+        $profCount  = switch($selMode){ 'All'{ if($script:optIncludeMid -or $selPreset -eq 'Extreme'){4}else{3} } default{1} }
+        $estSecMenu = $selCores.Count * $cycPreview * $profCount * ($secPreview+2)
+
+        Write-Host "   MAIN MENU" -ForegroundColor White
+        Write-Host "   ---------" -ForegroundColor DarkGray
+        Write-Host ("     1.  Cores ...... {0}" -f (Format-CoreList $selCores)) -ForegroundColor Gray
+        Write-Host ("     2.  Test type .. {0}" -f $selMode) -ForegroundColor Gray
+        Write-Host ("     3.  Duration ... {0}  ({1}s per profile, {2} cycle(s))" -f $selPreset,$secPreview,$cycPreview) -ForegroundColor Gray
+        Write-Host  "     4.  Advanced options" -ForegroundColor Gray
+        Write-Host ""
+        Write-Host ("        estimated run time: ~{0}   (ETA {1:HH:mm})" -f (Format-HMS $estSecMenu),((Get-Date).AddSeconds($estSecMenu))) -ForegroundColor DarkGray
+        Write-Host ""
+        Write-Host "     5.  START TEST" -ForegroundColor Green
+        Write-Host "     0.  Exit" -ForegroundColor DarkGray
+        switch(Read-Choice){
+            '1' { $prev2 = Get-PreviousFailures; $selCores = Select-Cores -Current $selCores -Failed $prev2.Cores }
+            '2' { $selMode = Select-Mode -Current $selMode }
+            '3' { $selPreset = Select-Duration -CurrentPreset $selPreset }
+            '4' { Select-Advanced }
+            '5' { if($selCores.Count -gt 0){ $go=$true } else { Write-Host "   Select at least one core first." -ForegroundColor Red; Start-Sleep 2 } }
+            '0' { Write-Host ""; return }
+        }
+    }
+    Clear-Host
+}
+
+# ---- Resolve menu choices into the run configuration ----
+$Cores = $selCores; $Mode = $selMode
+switch($selPreset){
+    'Quick'     { $d=@{SecondsPerCore=90; Cycles=1} }
+    'Standard'  { $d=@{SecondsPerCore=150;Cycles=1} }
+    'Thorough'  { $d=@{SecondsPerCore=300;Cycles=2}; $script:optShuffle=$true }
+    'Overnight' { $d=@{SecondsPerCore=600;Cycles=6}; $script:optShuffle=$true }
+    'Extreme'   { $d=@{SecondsPerCore=300;Cycles=3}; $script:optShuffle=$true; $script:optIncludeMid=$true; $script:optSweep=$true; $script:optThreads=2 }
+    'Custom'    { $d=@{SecondsPerCore=$script:customSeconds;Cycles=$script:optCycles} }
+    default     { $d=@{SecondsPerCore=150;Cycles=1} }
+}
+if (-not $PSBoundParameters.ContainsKey('SecondsPerCore')) { $SecondsPerCore = $d.SecondsPerCore }
+if (-not $PSBoundParameters.ContainsKey('Cycles'))         { $Cycles         = if($selPreset -in 'Custom'){$script:optCycles}else{$d.Cycles} }
+if ($Preset -eq 'Extreme') { $script:optIncludeMid=$true; $script:optSweep=$true; if(-not $PSBoundParameters.ContainsKey('ThreadsPerCore')){ $script:optThreads=2 } }
+
+$TransientSweep = [switch]$script:optSweep
+$Shuffle        = [switch]$script:optShuffle
+$StopOnError    = [switch]$script:optStopOnError
+$IncludeMid     = [switch]$script:optIncludeMid
+$ThreadsPerCore = $script:optThreads
+
 $heavyThreads = if($smtOn){[math]::Min($ThreadsPerCore,2)}else{1}
-$coreList = if($Cores){@($Cores|Where-Object{$coreMasks.ContainsKey($_)})}else{@(0..($physCores-1))}
-if(-not $coreList){ Write-Host "No valid cores." -ForegroundColor Red; return }
+$coreList = @($Cores|Where-Object{$coreMasks.ContainsKey($_)})
+if(-not $coreList -or $coreList.Count -eq 0){ Write-Host "No valid cores selected." -ForegroundColor Red; return }
 
 # ---- Calibrate iters-per-block for each compiled kernel ----
 function Get-Iters { param([string]$ClassName,[double]$TargetMs)
@@ -359,7 +632,6 @@ function Get-Iters { param([string]$ClassName,[double]$TargetMs)
 }
 
 # ---- Build the profile plan ----
-# each profile: Name, Kernel(class), Pattern, Threads, MaskKey(one/both), BlockIters, OnMs, OffMs, Sweep
 $profiles = @()
 function Add-Profile { param($Name,$KernelKey,$Pattern,$Threads,$MaskKey,$TargetMs)
     $cls=$Kernels[$KernelKey]
@@ -374,42 +646,27 @@ $wantMid       = ($Mode -eq 'Mid') -or ($Mode -eq 'All' -and $IncludeMid)
 $wantTransient = ($Mode -in 'All','Transient')
 $wantHeavy     = ($Mode -in 'All','Heavy')
 
-if ($wantBoost)     { Add-Profile 'BOOST'     'scalar'  'sustained' 1                                 'one'  100 }
-if ($wantMid)       { Add-Profile 'MID'       $midKey   'sustained' 1                                 'one'  100 }
-if ($wantTransient) { Add-Profile 'TRANSIENT' $wideKey  'transient' $(if($smtOn){2}else{1})           'both' 0.4 }
-if ($wantHeavy)     { Add-Profile 'HEAVY'     $wideKey  'sustained' $heavyThreads                     $(if($heavyThreads -ge 2){'both'}else{'one'}) 100 }
+if ($wantBoost)     { Add-Profile 'BOOST'     'scalar'  'sustained' 1                       'one'  100 }
+if ($wantMid)       { Add-Profile 'MID'       $midKey   'sustained' 1                       'one'  100 }
+if ($wantTransient) { Add-Profile 'TRANSIENT' $wideKey  'transient' $(if($smtOn){2}else{1}) 'both' 0.4 }
+if ($wantHeavy)     { Add-Profile 'HEAVY'     $wideKey  'sustained' $heavyThreads           $(if($heavyThreads -ge 2){'both'}else{'one'}) 100 }
 if (-not $profiles) { Write-Host "No profiles selected for Mode '$Mode'." -ForegroundColor Red; return }
-
-# ---- Crash forensics from prior run ----
-if (Test-Path $LogPath) {
-    try {
-        $tail=Get-Content $LogPath -Tail 100; $suspect=$null; $idx=-1
-        for($j=$tail.Count-1;$j -ge 0;$j--){ if($tail[$j] -match 'begin core (\d+)'){ $suspect=$matches[1]; $idx=$j; break } }
-        if($null -ne $suspect){
-            $after=$tail[$idx..($tail.Count-1)]
-            if(-not (($after -match ("core {0}\b.*(PASS|FAIL|WHEA|REF)" -f $suspect)) -or ($after -match 'RUN END'))){
-                Write-Host ""; Write-Host "  !! A previous run stopped while testing Core $suspect with no result recorded." -ForegroundColor Magenta
-                Write-Host "     If that was a hard lock/BSOD, Core $suspect is your prime suspect." -ForegroundColor Magenta
-            }
-        }
-    } catch {}
-}
 
 # ---- Banner ----
 $vecName = switch ($wideKey) { 'avx512' {'AVX-512 512-bit'} 'simd' {'AVX2 256-bit'} default {'scalar'} }
 Write-Host ""
-Write-Host "  X3D Undervolt CO Killer  (v3)" -ForegroundColor Cyan
+Write-Host "  X3D Undervolt CO Killer  (v4)" -ForegroundColor Cyan
 Write-Host "  =============================" -ForegroundColor Cyan
 Write-Host ("  CPU        : {0}" -f $cpu.Name.Trim())
-Write-Host ("  Cores      : {0} physical / {1} logical (SMT {2})" -f $physCores,$logCores,($(if($smtOn){'on'}else{'off'})))
+Write-Host ("  Cores      : testing {0} of {1}  ->  {2}" -f $coreList.Count,$physCores,(Format-CoreList $coreList)) -ForegroundColor White
 Write-Host ("  Kernels    : {0}   (heavy/transient use {1})" -f (($Kernels.Keys|Sort-Object) -join ', '), $vecName)
 Write-Host ("  PowerShell : {0} ({1})" -f $PSVersionTable.PSVersion,$PSVersionTable.PSEdition)
 if ($wideKey -ne 'avx512' -and -not $NoAvx512) {
     Write-Host "               (AVX-512 not active: needs PowerShell 7.4+/.NET 8+ on an AVX-512 CPU.)" -ForegroundColor DarkGray
 }
-Write-Host ("  Profiles/core:")
+Write-Host  "  Profiles/core:"
 foreach($p in $profiles){
-    $extra = if($p.Pattern -eq 'transient'){ if($p.Sweep){"toggle sweep 2-17ms, 2 threads"}else{"toggle $($p.OnMs)/$($p.OffMs)ms, $($p.Threads) threads"} } else { "$($p.Threads) thread(s)" }
+    $extra = if($p.Pattern -eq 'transient'){ if($p.Sweep){"toggle sweep 2-17ms, $($p.Threads) threads"}else{"toggle $($p.OnMs)/$($p.OffMs)ms, $($p.Threads) threads"} } else { "$($p.Threads) thread(s)" }
     Write-Host ("     {0,-9} {1,-8} {2}" -f $p.Name,$p.Kernel,$extra) -ForegroundColor Gray
 }
 $subTotal = $coreList.Count * $Cycles * $profiles.Count
@@ -421,7 +678,7 @@ if($canKeys){ Write-Host "  Press Q to stop cleanly after the current profile." 
 Write-Host ""
 
 [UvScalar]::KeepAwake($true)
-Write-Log "=== RUN START === $($cpu.Name.Trim()) | wide=$vecName | mode=$Mode | $($coreList.Count)c x $Cycles cy x $($profiles.Count)prof x ${SecondsPerCore}s"
+Write-Log "=== RUN START === $($cpu.Name.Trim()) | wide=$vecName | mode=$Mode | cores=$($coreList -join ',') | $($coreList.Count)c x $Cycles cy x $($profiles.Count)prof x ${SecondsPerCore}s"
 
 $results=@{}
 foreach($c in $coreList){ $results[$c]=[pscustomobject]@{ Core=$c; Pass=0; Fail=0; Whea=0; PeakMHz=0; Status='pending'; Detail='' } }
