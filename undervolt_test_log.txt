@@ -1,0 +1,11 @@
+2026-07-22 21:32:56  === RUN START === AMD Ryzen 9 9950X3D 16-Core Processor | wide=AVX-512 512-bit | mode=Transient | cores=6,15 | 2c x 1 cy x 1prof x 600s
+2026-07-22 21:32:56  CYCLE 1 : begin core 6 [TRANSIENT] (CPU12+13) mask=0x3000
+2026-07-22 21:42:57  CYCLE 1 : core 6 [TRANSIENT] PASS OK 2239380
+2026-07-22 21:42:57  CYCLE 1 : begin core 15 [TRANSIENT] (CPU30+31) mask=0xC0000000
+2026-07-22 21:50:56  CYCLE 1 : core 15 [TRANSIENT] FAIL HANG / soft-lock (killed)
+2026-07-22 21:50:56  === RUN END === elapsed 00:18:00 | failed: 15
+2026-07-22 21:51:21  === RUN START === AMD Ryzen 9 9950X3D 16-Core Processor | wide=AVX-512 512-bit | mode=Transient | cores=0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15 | 16c x 1 cy x 1prof x 150s
+2026-07-22 21:51:21  CYCLE 1 : begin core 0 [TRANSIENT] (CPU0+1) mask=0x3
+2026-07-22 21:51:42  === RUN END === elapsed 00:00:22 | failed: 
+2026-07-22 22:29:10  === RUN START === AMD Ryzen 9 9950X3D 16-Core Processor | wide=AVX-512 512-bit | mode=Transient | cores=0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15 | 16c x 1 cy x 1prof x 150s
+2026-07-22 22:29:10  CYCLE 1 : begin core 0 [TRANSIENT] (CPU0+1) mask=0x3
