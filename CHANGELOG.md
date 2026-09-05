@@ -4,6 +4,35 @@ All notable changes to **X3D Undervolt CO Killer** (`Test-UndervoltStability.ps1
 
 ---
 
+## [1.0.5] - 2026-09-04
+
+Docs and hygiene polish on top of v4. **Testing engine unchanged.**
+
+### Changed
+
+- **README** rewritten for a clearer first-run path: what the tool is, why other
+  stress tools miss CO instability, requirements, quick start (menu + .bat
+  launchers), CLI usage, and safety - without advertising files that are not
+  in the repo.
+- **Suggested retest prompt** defaults empty Enter to **N** (open the menu with
+  cores pre-selected) instead of treating blank input as Yes.
+- **Worker Add-Type gating** - child workers only compile the kernel class they
+  will run (scalar always; SIMD/AVX-512 only when needed), cutting per-worker
+  compile cost.
+
+### Fixed
+
+- **Repo hygiene.** Stopped tracking undervolt_test_log.txt (runtime artifact
+  that poisoned first-run suggested retests for fresh clones). Added .gitignore
+  for undervolt_test_log.txt and undervolt_results_*.csv.
+
+### Upgrade notes
+
+Drop-in over 1.0.4 / v4. Keep your local log/CSV files if you want failure memory
+to keep working; they stay gitignored on purpose.
+
+---
+
 ## [v4] — Interactive menu & failure memory
 
 The testing engine is **unchanged** from v3 — same kernels, same profiles, same
