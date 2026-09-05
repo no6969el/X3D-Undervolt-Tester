@@ -226,22 +226,29 @@ $usingsAvx  = $usingsBase + "using System.Runtime.Intrinsics;`nusing System.Runt
 
 $Kernels = @{}   # friendly name -> class name actually compiled
 
-# scalar: always
+# Workers always need UvScalar for SetAffinity; compile other kernels only if this
+# process will use them. Orchestrator compiles everything available.
+$needSimd   = (-not $WorkerMode) -or ($KernelClass -eq 'UvSimd')
+$needAvx512 = (-not $WorkerMode) -or ($KernelClass -eq 'UvAvx512')
+
+# scalar: always (affinity helpers + scalar kernel)
 Add-Type -TypeDefinition ($usingsBase + $classTemplate.Replace('__CLASS__','UvScalar').Replace('//__BLOCK__',$scalarBlock)) -ErrorAction Stop
 $Kernels['scalar'] = 'UvScalar'
 
 # simd (AVX2): if it compiles
-try {
-    $refs = @(); if ($PSVersionTable.PSEdition -eq 'Desktop') { try { $refs += [System.Numerics.Vector[double]].Assembly.Location } catch {} }
-    $simdSrc = $usingsBase + $classTemplate.Replace('__CLASS__','UvSimd').Replace('//__BLOCK__',$simdBlock)
-    if ($refs.Count -gt 0) { Add-Type -TypeDefinition $simdSrc -ReferencedAssemblies $refs -ErrorAction Stop }
-    else                   { Add-Type -TypeDefinition $simdSrc -ErrorAction Stop }
-    $Kernels['simd'] = 'UvSimd'
-} catch {}
+if ($needSimd) {
+    try {
+        $refs = @(); if ($PSVersionTable.PSEdition -eq 'Desktop') { try { $refs += [System.Numerics.Vector[double]].Assembly.Location } catch {} }
+        $simdSrc = $usingsBase + $classTemplate.Replace('__CLASS__','UvSimd').Replace('//__BLOCK__',$simdBlock)
+        if ($refs.Count -gt 0) { Add-Type -TypeDefinition $simdSrc -ReferencedAssemblies $refs -ErrorAction Stop }
+        else                   { Add-Type -TypeDefinition $simdSrc -ErrorAction Stop }
+        $Kernels['simd'] = 'UvSimd'
+    } catch {}
+}
 
 # avx-512: if CPU + runtime support it
 $avx512ok = $false
-if (-not $NoAvx512) { try { $avx512ok = [System.Runtime.Intrinsics.X86.Avx512F]::IsSupported } catch { $avx512ok = $false } }
+if ($needAvx512 -and -not $NoAvx512) { try { $avx512ok = [System.Runtime.Intrinsics.X86.Avx512F]::IsSupported } catch { $avx512ok = $false } }
 if ($avx512ok) {
     try {
         Add-Type -TypeDefinition ($usingsAvx + $classTemplate.Replace('__CLASS__','UvAvx512').Replace('//__BLOCK__',$avx512Block)) -ErrorAction Stop
@@ -554,9 +561,9 @@ if($interactive){
         Write-Host ""
         Write-Host "   (Raise the Curve Optimizer offset on those cores in BIOS first!)" -ForegroundColor DarkYellow
         Write-Host ""
-        Write-Host "   Run this retest now?  [Y] yes, start    [N] no, open the menu" -ForegroundColor White
+        Write-Host "   Run this retest now?  [Y] yes, start    [N] no, open the menu (default N)" -ForegroundColor White
         $ans = Read-Host "   Choice"
-        if($ans -match '^(y|yes|)$'){
+        if($ans -match '^(y|yes)$'){
             $selCores=$suggestCores; $selMode=$suggestMode; $selPreset='Thorough'
             $script:optSweep=$true; $interactive=$false   # skip straight to the run
         } else {
